@@ -75,6 +75,12 @@ prompt = """
 reasoning_effort = "none"
 "#;
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptPreset {
+    pub name: String,
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct FormatConfig {
     /// 整形の接続先。"opencode-go"、"openai"(API キー)、"chatgpt"(ChatGPT でログイン)、"custom"(OpenAI 互換)
@@ -93,6 +99,10 @@ pub struct FormatConfig {
     pub save_history: bool,
     #[serde(default = "default_prompt")]
     pub prompt: String,
+    #[serde(default)]
+    pub prompt_presets: Vec<PromptPreset>,
+    #[serde(default)]
+    pub selected_prompt: usize,
     /// リクエスト本体にそのまま混ぜる項目。推論の止め方がモデルごとに違うため設定で持つ
     #[serde(default)]
     pub extra_body: serde_json::Map<String, serde_json::Value>,
@@ -132,6 +142,8 @@ impl Default for FormatConfig {
             timeout_ms: default_timeout_ms(),
             save_history: false,
             prompt: default_prompt(),
+            prompt_presets: Vec::new(),
+            selected_prompt: 0,
             extra_body: serde_json::Map::new(),
             provider: default_provider(),
             openai_api_key: String::new(),
@@ -346,6 +358,19 @@ pub fn load() -> Result<Config, String> {
         std::fs::read_to_string(&path).map_err(|e| format!("設定ファイルを読めません: {e}"))?;
     let mut cfg = parse(&text)?;
     upgrade_legacy_defaults(&mut cfg.format);
+    if cfg.format.prompt_presets.is_empty() {
+        cfg.format.prompt_presets.push(PromptPreset {
+            name: "指示文 1".into(),
+            prompt: cfg.format.prompt.clone(),
+        });
+    }
+    cfg.format.selected_prompt = cfg
+        .format
+        .selected_prompt
+        .min(cfg.format.prompt_presets.len() - 1);
+    cfg.format.prompt = cfg.format.prompt_presets[cfg.format.selected_prompt]
+        .prompt
+        .clone();
     if !cfg.format.api_key.is_empty() || !cfg.format.openai_api_key.is_empty() {
         // 旧版の平文キーを必ず先に暗号化保存してから、TOML 内の秘密を取り除く。
         // 移行に失敗した場合は元ファイルを変更しない。

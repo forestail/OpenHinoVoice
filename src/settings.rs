@@ -260,6 +260,15 @@ impl Settings {
         let mut doc: toml_edit::DocumentMut = updated
             .parse()
             .map_err(|e| format!("設定ファイルの更新に失敗しました: {e}"))?;
+        let mut presets = toml_edit::Array::new();
+        for preset in &f.prompt_presets {
+            let mut table = toml_edit::InlineTable::new();
+            table.insert("name", toml_edit::Value::from(preset.name.as_str()));
+            table.insert("prompt", toml_edit::Value::from(preset.prompt.as_str()));
+            presets.push(toml_edit::Value::InlineTable(table));
+        }
+        doc["format"]["prompt_presets"] = toml_edit::value(presets);
+        doc["format"]["selected_prompt"] = toml_edit::value(f.selected_prompt as i64);
         // 用語辞書だけは配列テーブルのため別途更新。その他のTOMLは保持する。
         doc.remove("terms");
         if !self.cfg.terms.is_empty() {
@@ -598,14 +607,56 @@ impl Settings {
 
         ui.add_space(10.0);
         egui::CollapsingHeader::new("指示文(整形のしかた)").show(ui, |ui| {
+            let f = &mut self.cfg.format;
+            if f.prompt_presets.is_empty() {
+                f.prompt_presets.push(config::PromptPreset {
+                    name: "指示文 1".into(),
+                    prompt: f.prompt.clone(),
+                });
+                f.selected_prompt = 0;
+            }
+            f.selected_prompt = f.selected_prompt.min(f.prompt_presets.len() - 1);
+            let old = f.selected_prompt;
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_label("指示文を選択")
+                    .selected_text(&f.prompt_presets[f.selected_prompt].name)
+                    .show_ui(ui, |ui| {
+                        for (i, preset) in f.prompt_presets.iter().enumerate() {
+                            ui.selectable_value(&mut f.selected_prompt, i, &preset.name);
+                        }
+                    });
+                if ui.button("追加").clicked() {
+                    f.prompt_presets.push(config::PromptPreset {
+                        name: format!("指示文 {}", f.prompt_presets.len() + 1),
+                        prompt: config::DEFAULT_PROMPT.into(),
+                    });
+                    f.selected_prompt = f.prompt_presets.len() - 1;
+                }
+                if ui
+                    .add_enabled(f.prompt_presets.len() > 1, egui::Button::new("削除"))
+                    .clicked()
+                {
+                    f.prompt_presets.remove(f.selected_prompt);
+                    f.selected_prompt = f.selected_prompt.min(f.prompt_presets.len() - 1);
+                    f.prompt = f.prompt_presets[f.selected_prompt].prompt.clone();
+                }
+            });
+            if old != f.selected_prompt {
+                f.prompt = f.prompt_presets[f.selected_prompt].prompt.clone();
+            }
+            ui.horizontal(|ui| {
+                ui.label("名前");
+                ui.text_edit_singleline(&mut f.prompt_presets[f.selected_prompt].name);
+            });
             ui.add(
-                egui::TextEdit::multiline(&mut self.cfg.format.prompt)
+                egui::TextEdit::multiline(&mut f.prompt)
                     .desired_rows(7)
                     .desired_width(f32::INFINITY),
             );
             if ui.small_button("初期の指示文に戻す").clicked() {
-                self.cfg.format.prompt = config::DEFAULT_PROMPT.to_string();
+                f.prompt = config::DEFAULT_PROMPT.to_string();
             }
+            f.prompt_presets[f.selected_prompt].prompt = f.prompt.clone();
         });
 
         ui.add_space(14.0);
