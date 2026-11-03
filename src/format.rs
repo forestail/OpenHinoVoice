@@ -30,6 +30,7 @@ pub enum FormatError {
     MissingApiKey,
     MissingModel,
     Http(u16),
+    HttpDetail(u16, String),
     Timeout,
     Network(String),
     BadResponse(String),
@@ -43,7 +44,9 @@ impl FormatError {
     pub fn retryable(&self) -> bool {
         match self {
             FormatError::Timeout | FormatError::Network(_) | FormatError::Busy(_) => true,
-            FormatError::Http(code) => *code == 408 || *code == 429 || *code >= 500,
+            FormatError::Http(code) | FormatError::HttpDetail(code, _) => {
+                *code == 408 || *code == 429 || *code >= 500
+            }
             _ => false,
         }
     }
@@ -55,6 +58,9 @@ impl fmt::Display for FormatError {
             FormatError::MissingApiKey => write!(f, "APIキー未設定"),
             FormatError::MissingModel => write!(f, "整形モデル未設定"),
             FormatError::Http(code) => write!(f, "整形APIエラー HTTP {code}"),
+            FormatError::HttpDetail(code, detail) => {
+                write!(f, "整形APIエラー HTTP {code}: {detail}")
+            }
             FormatError::Timeout => write!(f, "整形が時間切れ"),
             FormatError::Network(e) => write!(f, "整形APIに接続できません: {e}"),
             FormatError::BadResponse(e) => write!(f, "整形APIの応答が不正です: {e}"),
@@ -66,40 +72,70 @@ impl fmt::Display for FormatError {
 
 impl std::error::Error for FormatError {}
 
-// 接続を使い回すため、プロセスで 1 つの Agent を共有する。新規の TCP と TLS の確立に約 280ms かかる
-pub(crate) fn agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(ureq::Agent::new)
+/// 空欄は直接接続。認証情報やパスを含まない HTTP プロキシのみ受け付ける。
+pub fn proxy_address(host: &str, port: u16) -> Result<Option<String>, FormatError> {
+    let host = host.trim();
+    if host.is_empty() && port == 0 {
+        return Ok(None);
+    }
+    if host.is_empty() || port == 0 {
+        return Err(FormatError::Provider(
+            "プロキシのサーバー名とポートを入力してください".into(),
+        ));
+    }
+    let address = format!("http://{host}:{port}");
+    let parsed = url::Url::parse(&address)
+        .map_err(|_| FormatError::Provider("プロキシのサーバー名が不正です".into()))?;
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.port_or_known_default() != Some(port)
+    {
+        return Err(FormatError::Provider(
+            "プロキシのサーバー名が不正です".into(),
+        ));
+    }
+    Ok(Some(address))
 }
 
-/// api.openai.com は使い回した接続に応答を返さないことがあった(2026-10 の実測)ので、毎回新しく接続する
 pub(crate) fn openai_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| ureq::AgentBuilder::new().max_idle_connections(0).build())
 }
 
-/// 整形用の Agent。合計時間ではなく、応答が wait の間ずっと途切れたら打ち切る(読み取り 1 回ごとの上限)。
-/// 長く話すと整形した文を返すだけで数秒かかるので、合計時間で切ると話した内容の整形が必ず失敗する
-pub(crate) fn streaming_agent(wait: Duration, pooled: bool) -> ureq::Agent {
-    static AGENTS: OnceLock<Mutex<HashMap<(u128, bool), ureq::Agent>>> = OnceLock::new();
+pub(crate) fn streaming_agent(
+    wait: Duration,
+    pooled: bool,
+    proxy: Option<&str>,
+) -> Result<ureq::Agent, FormatError> {
+    type AgentCache = Mutex<HashMap<(u128, bool, String), ureq::Agent>>;
+    static AGENTS: OnceLock<AgentCache> = OnceLock::new();
     let mut agents = AGENTS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    agents
-        .entry((wait.as_millis(), pooled))
-        .or_insert_with(|| {
-            let builder = ureq::AgentBuilder::new()
-                .timeout_connect(wait)
-                .timeout_read(wait);
-            if pooled {
-                builder
-            } else {
-                builder.max_idle_connections(0)
-            }
-            .build()
-        })
-        .clone()
+    let key = (wait.as_millis(), pooled, proxy.unwrap_or("").to_string());
+    if let Some(agent) = agents.get(&key) {
+        return Ok(agent.clone());
+    }
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(wait)
+        .timeout_read(wait);
+    if !pooled {
+        builder = builder.max_idle_connections(0);
+    }
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(
+            ureq::Proxy::new(proxy)
+                .map_err(|_| FormatError::Provider("プロキシ設定が不正です".into()))?,
+        );
+    }
+    let agent = builder.build();
+    agents.insert(key, agent.clone());
+    Ok(agent)
 }
 
 fn wait_of(cfg: &FormatConfig) -> Duration {
@@ -188,7 +224,13 @@ pub fn prewarm(cfg: &FormatConfig) {
     if validate_base_url(base).is_err() {
         return;
     }
-    let resp = streaming_agent(wait_of(cfg), true)
+    let Ok(proxy) = proxy_address(&cfg.proxy_host, cfg.proxy_port) else {
+        return;
+    };
+    let Ok(agent) = streaming_agent(wait_of(cfg), true, proxy.as_deref()) else {
+        return;
+    };
+    let resp = agent
         .get(&format!("{base}/models"))
         .timeout(Duration::from_secs(5))
         .set("Authorization", &format!("Bearer {key}"))
@@ -227,6 +269,12 @@ pub fn format(cfg: &FormatConfig, raw: &str) -> Result<String, FormatError> {
             }
             chat_completions(
                 OPENAI_API,
+                &cfg.proxy_host,
+                cfg.proxy_port,
+                cfg.token_parameters
+                    .get(OPENAI_API)
+                    .copied()
+                    .unwrap_or_default(),
                 &cfg.openai_api_key,
                 &cfg.openai_model,
                 &extra,
@@ -238,6 +286,12 @@ pub fn format(cfg: &FormatConfig, raw: &str) -> Result<String, FormatError> {
         }
         _ => chat_completions(
             &cfg.base_url,
+            &cfg.proxy_host,
+            cfg.proxy_port,
+            cfg.token_parameters
+                .get(cfg.base_url.trim().trim_end_matches('/'))
+                .copied()
+                .unwrap_or_default(),
             &cfg.api_key,
             &cfg.model,
             &cfg.extra_body,
@@ -269,6 +323,9 @@ pub fn format(cfg: &FormatConfig, raw: &str) -> Result<String, FormatError> {
 #[allow(clippy::too_many_arguments)]
 fn chat_completions(
     base_url: &str,
+    proxy_host: &str,
+    proxy_port: u16,
+    token_parameter: crate::config::TokenParameter,
     api_key: &str,
     model: &str,
     extra: &serde_json::Map<String, serde_json::Value>,
@@ -302,8 +359,22 @@ fn chat_completions(
             obj.insert("temperature".into(), t.into());
         }
         obj.extend(extra.clone());
+        // 一方を明示した追加設定は尊重し、両方を送らない。
+        let parameter = token_parameter.resolve(base_url);
+        if obj.contains_key("max_completion_tokens") {
+            obj.remove("max_tokens");
+        } else if parameter == "max_completion_tokens" {
+            if let Some(limit) = obj.remove("max_tokens") {
+                obj.insert(parameter.into(), limit);
+            }
+        }
     }
-    let agent = streaming_agent(wait, base_url.trim_end_matches('/') != OPENAI_API);
+    let proxy = proxy_address(proxy_host, proxy_port)?;
+    let agent = streaming_agent(
+        wait,
+        base_url.trim_end_matches('/') != OPENAI_API,
+        proxy.as_deref(),
+    )?;
     let started = std::time::Instant::now();
     let resp = agent
         .post(&url)
@@ -311,10 +382,12 @@ fn chat_completions(
         .set("Content-Type", "application/json")
         .set("User-Agent", USER_AGENT)
         .set("x-opencode-session", session_id())
-        .send_json(body);
+        .send_json(&body);
     let resp = match resp {
         Ok(r) => r,
-        Err(ureq::Error::Status(code, _)) => return Err(FormatError::Http(code)),
+        Err(ureq::Error::Status(code, response)) => {
+            return Err(http_error(code, response, api_key))
+        }
         Err(ureq::Error::Transport(t)) => return Err(transport_error(&t)),
     };
     if resp.content_type() == "text/event-stream" {
@@ -375,16 +448,76 @@ fn read_chat_stream(reader: impl Read, started: std::time::Instant) -> Result<St
     Err(FormatError::Network("応答が途中で切れました".into()))
 }
 
+/// エラー本文は上限付きで読み、HTTP ステータスとともに表示する。
+/// JSON は診断に必要な項目だけ取り出し、送信したキーが含まれた場合は伏せる。
+fn http_error(code: u16, response: ureq::Response, api_key: &str) -> FormatError {
+    let mut bytes = Vec::new();
+    let _ = response.into_reader().take(16_384).read_to_end(&mut bytes);
+    let body = String::from_utf8_lossy(&bytes);
+    let detail = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value) => {
+            let error = value.get("error").unwrap_or(&value);
+            if let Some(message) = error.as_str() {
+                message.to_string()
+            } else {
+                ["code", "type", "param", "message"]
+                    .into_iter()
+                    .filter_map(|field| {
+                        error
+                            .get(field)
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!("{field}: {s}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        Err(_) => body.into_owned(),
+    };
+    let detail = if api_key.is_empty() {
+        detail
+    } else {
+        detail.replace(api_key, "[APIキー非表示]")
+    };
+    let detail = detail.trim();
+    if detail.is_empty() {
+        FormatError::Http(code)
+    } else {
+        let mut shown: String = detail.chars().take(2000).collect();
+        if detail.chars().count() > 2000 {
+            shown.push_str("…（省略）");
+        }
+        FormatError::HttpDetail(code, shown)
+    }
+}
+
 /// OpenAI 互換の /models から使えるモデルの ID を取る。(ID, 表示名) の組で返す
-pub fn list_models(base_url: &str, api_key: &str) -> Result<Vec<(String, String)>, String> {
+pub fn list_models(
+    base_url: &str,
+    api_key: &str,
+    proxy_host: &str,
+    proxy_port: u16,
+) -> Result<Vec<(String, String)>, String> {
     validate_base_url(base_url).map_err(|e| e.to_string())?;
-    let resp = agent()
+    let proxy = proxy_address(proxy_host, proxy_port).map_err(|e| e.to_string())?;
+    let agent = streaming_agent(Duration::from_secs(15), true, proxy.as_deref())
+        .map_err(|e| e.to_string())?;
+    let resp = agent
         .get(&format!("{}/models", base_url.trim_end_matches('/')))
         .timeout(Duration::from_secs(15))
         .set("Authorization", &format!("Bearer {api_key}"))
         .set("User-Agent", USER_AGENT)
         .call()
-        .map_err(|e| format!("モデル一覧を取得できません: {e}"))?;
+        .map_err(|e| match e {
+            ureq::Error::Status(code, response) => {
+                format!(
+                    "モデル一覧を取得できません: {}",
+                    http_error(code, response, api_key)
+                )
+            }
+            other => format!("モデル一覧を取得できません: {other}"),
+        })?;
     let v: serde_json::Value = resp.into_json().map_err(|e| e.to_string())?;
     let mut ids: Vec<String> = v["data"]
         .as_array()
@@ -701,17 +834,128 @@ mod tests {
     }
 
     #[test]
+    fn azure_error_details_are_displayed_without_retry() {
+        let url = serve_once(|_| {
+            (
+                400,
+                serde_json::json!({"error": {
+                    "code": "unsupported_parameter", "param": "max_tokens",
+                    "message": "Use max_completion_tokens instead."
+                }})
+                .to_string(),
+            )
+        });
+        let error = format_with_retry(&cfg_for(url), "hello", &|| false, |_| {
+            panic!("400 must not be retried")
+        })
+        .unwrap_err();
+        let shown = error.to_string();
+        for expected in [
+            "HTTP 400",
+            "unsupported_parameter",
+            "param: max_tokens",
+            "Use max_completion_tokens instead.",
+        ] {
+            assert!(shown.contains(expected), "{shown}");
+        }
+    }
+
+    #[test]
+    fn model_list_errors_include_plain_text_and_hide_api_key() {
+        let url = serve_once(|_| (502, "Gateway failed for test-key".into()));
+        let shown = list_models(&url, "test-key", "", 0).unwrap_err();
+        assert!(shown.contains("HTTP 502"));
+        assert!(shown.contains("Gateway failed for [APIキー非表示]"));
+        assert!(!shown.contains("test-key"));
+    }
+
+    #[test]
+    fn error_details_are_bounded_and_keep_retry_status() {
+        let url = serve_once(|_| (503, "あ".repeat(3000)));
+        let error = format(&cfg_for(url), "hello").unwrap_err();
+        assert!(error.retryable());
+        assert!(error.to_string().contains("省略"));
+        assert!(error.to_string().chars().count() < 2100);
+    }
+
+    #[test]
+    fn empty_error_body_keeps_http_status() {
+        let url = serve_once(|_| (400, String::new()));
+        assert_eq!(format(&cfg_for(url), "hello"), Err(FormatError::Http(400)));
+    }
+
+    #[test]
+    fn proxy_configuration_validates_server_and_port() {
+        assert_eq!(proxy_address("", 0).unwrap(), None);
+        assert_eq!(
+            proxy_address("proxy.example", 8080).unwrap(),
+            Some("http://proxy.example:8080".into())
+        );
+        for (host, port) in [
+            ("", 8080),
+            ("proxy.example", 0),
+            ("user:pass@proxy.example", 8080),
+            ("proxy.example/path", 8080),
+        ] {
+            assert!(proxy_address(host, port).is_err());
+        }
+    }
+
+    #[test]
+    fn formatting_uses_the_configured_proxy() {
+        let url = serve_once(|request| {
+            assert!(
+                request.starts_with("POST http://localhost:1234/chat/completions "),
+                "{request}"
+            );
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"hello"}}]}"#.into(),
+            )
+        });
+        let parsed = url::Url::parse(&url).unwrap();
+        let mut cfg = cfg_for("http://localhost:1234".into());
+        cfg.proxy_host = parsed.host_str().unwrap().into();
+        cfg.proxy_port = parsed.port().unwrap();
+        assert_eq!(format(&cfg, "hello"), Ok("hello".into()));
+    }
+
+    #[test]
+    fn completion_tokens_is_sent_on_first_request() {
+        let url = serve_once(|req| {
+            let payload: serde_json::Value =
+                serde_json::from_str(req.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert!(payload.get("max_tokens").is_none());
+            assert_eq!(payload["max_completion_tokens"], 276);
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"hello"}}]}"#.into(),
+            )
+        });
+        let mut cfg = cfg_for(url.clone());
+        cfg.token_parameters
+            .insert(url, crate::config::TokenParameter::MaxCompletionTokens);
+        assert_eq!(format(&cfg, "hello"), Ok("hello".into()));
+    }
+
+    #[test]
     fn http_401_is_error() {
         let url = serve_once(|_| (401, r#"{"error":"unauthorized"}"#.to_string()));
         let cfg = cfg_for(url);
-        assert_eq!(format(&cfg, "hello"), Err(FormatError::Http(401)));
+        assert_eq!(
+            format(&cfg, "hello"),
+            Err(FormatError::HttpDetail(401, "unauthorized".into()))
+        );
     }
 
     #[test]
     fn http_500_is_error() {
         let url = serve_once(|_| (500, r#"{"error":"boom"}"#.to_string()));
         let cfg = cfg_for(url);
-        assert_eq!(format(&cfg, "hello"), Err(FormatError::Http(500)));
+        assert_eq!(
+            format(&cfg, "hello"),
+            Err(FormatError::HttpDetail(500, "boom".into()))
+        );
     }
 
     #[test]

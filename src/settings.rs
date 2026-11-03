@@ -208,6 +208,7 @@ impl Settings {
         use toml::Value as V;
         crate::lexicon::validate(&self.cfg.terms)?;
         let f = &self.cfg.format;
+        crate::format::proxy_address(&f.proxy_host, f.proxy_port).map_err(|e| e.to_string())?;
         let path = config::config_path();
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("設定ファイルを読めません: {e}"))?;
@@ -234,6 +235,8 @@ impl Settings {
             (None, "volume", V::from(self.cfg.volume as i64)),
             (Some("format"), "provider", V::from(f.provider.as_str())),
             (Some("format"), "base_url", V::from(f.base_url.trim())),
+            (Some("format"), "proxy_host", V::from(f.proxy_host.trim())),
+            (Some("format"), "proxy_port", V::from(f.proxy_port as i64)),
             (Some("format"), "api_key", V::from("")),
             (Some("format"), "model", V::from(f.model.trim())),
             (Some("format"), "openai_api_key", V::from("")),
@@ -268,6 +271,11 @@ impl Settings {
             presets.push(toml_edit::Value::InlineTable(table));
         }
         doc["format"]["prompt_presets"] = toml_edit::value(presets);
+        let mut parameters = toml_edit::Table::new();
+        for (url, parameter) in &f.token_parameters {
+            parameters[url] = toml_edit::value(parameter.as_str());
+        }
+        doc["format"]["token_parameters"] = toml_edit::Item::Table(parameters);
         doc["format"]["selected_prompt"] = toml_edit::value(f.selected_prompt as i64);
         // 用語辞書だけは配列テーブルのため別途更新。その他のTOMLは保持する。
         doc.remove("terms");
@@ -584,6 +592,64 @@ impl Settings {
             }
         }
 
+        if self.cfg.format.provider != "chatgpt" {
+            let f = &mut self.cfg.format;
+            grid(ui, "proxy", |ui| {
+                ui.label("HTTP プロキシ");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut f.proxy_host).hint_text("サーバー名（空欄で直接接続）").desired_width(230.0));
+                        ui.label("ポート");
+                        ui.add(egui::DragValue::new(&mut f.proxy_port).range(0..=65535));
+                    });
+                    hint(ui, "認証が必要なプロキシには対応していません。無効にする場合はサーバー名を空欄、ポートを 0 にします。");
+                });
+                ui.end_row();
+            });
+        }
+
+        if self.cfg.format.provider != "chatgpt" {
+            let f = &mut self.cfg.format;
+            let base = if f.provider == "openai" {
+                "https://api.openai.com/v1".to_string()
+            } else {
+                f.base_url.trim().trim_end_matches('/').to_string()
+            };
+            let parameter = f.token_parameters.entry(base.clone()).or_default();
+            grid(ui, "token_parameter", |ui| {
+                ui.label("出力上限の指定方法");
+                ui.vertical(|ui| {
+                    egui::ComboBox::from_id_salt("token_parameter_choice")
+                        .selected_text(if *parameter == config::TokenParameter::Auto {
+                            "自動"
+                        } else {
+                            parameter.as_str()
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(parameter, config::TokenParameter::Auto, "自動");
+                            ui.selectable_value(
+                                parameter,
+                                config::TokenParameter::MaxTokens,
+                                "max_tokens",
+                            );
+                            ui.selectable_value(
+                                parameter,
+                                config::TokenParameter::MaxCompletionTokens,
+                                "max_completion_tokens",
+                            );
+                        });
+                    hint(
+                        ui,
+                        &format!(
+                            "この接続先に保存します。送信する項目: {}",
+                            parameter.resolve(&base)
+                        ),
+                    );
+                });
+                ui.end_row();
+            });
+        }
+
         ui.add_space(14.0);
         grid(ui, "timeout", |ui| {
             ui.label("応答の停止を待つ時間");
@@ -744,14 +810,22 @@ impl Settings {
             self.models_job = Some(spawn(ui.ctx(), move || match f.provider.as_str() {
                 "chatgpt" => chatgpt::list_models()
                     .map(|m| m.into_iter().map(|m| (m.slug, m.display_name)).collect()),
-                "openai" => {
-                    crate::format::list_models("https://api.openai.com/v1", &f.openai_api_key)
-                }
+                "openai" => crate::format::list_models(
+                    "https://api.openai.com/v1",
+                    &f.openai_api_key,
+                    &f.proxy_host,
+                    f.proxy_port,
+                ),
                 // OpenCode Go の一覧は整形の窓口(/openai/v1)ではなく /inference/go/v1 にある
-                "opencode-go" => {
-                    crate::format::list_models("https://opencode.ai/inference/go/v1", &f.api_key)
+                "opencode-go" => crate::format::list_models(
+                    "https://opencode.ai/inference/go/v1",
+                    &f.api_key,
+                    &f.proxy_host,
+                    f.proxy_port,
+                ),
+                _ => {
+                    crate::format::list_models(&f.base_url, &f.api_key, &f.proxy_host, f.proxy_port)
                 }
-                _ => crate::format::list_models(&f.base_url, &f.api_key),
             }));
         }
         if chosen != current {

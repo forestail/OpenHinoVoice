@@ -492,7 +492,7 @@ pub fn format(
     }
     // 合計時間では切らず、応答が wait の間ずっと途切れたときだけ打ち切る
     let started = std::time::Instant::now();
-    let resp = crate::format::streaming_agent(wait, false)
+    let resp = crate::format::streaming_agent(wait, false, None)?
         .post(&format!("{API}/responses"))
         .set("Authorization", &format!("Bearer {token}"))
         .send_json(body);

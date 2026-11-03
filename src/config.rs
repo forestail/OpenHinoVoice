@@ -81,6 +81,41 @@ pub struct PromptPreset {
     pub prompt: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenParameter {
+    #[default]
+    Auto,
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl TokenParameter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+
+    pub fn resolve(self, base_url: &str) -> &'static str {
+        let azure = url::Url::parse(base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .is_some_and(|h| {
+                h.ends_with(".openai.azure.com")
+                    || h.ends_with(".services.ai.azure.com")
+                    || h.ends_with(".cognitiveservices.azure.com")
+            });
+        match self {
+            Self::MaxCompletionTokens => "max_completion_tokens",
+            Self::Auto if azure => "max_completion_tokens",
+            _ => "max_tokens",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct FormatConfig {
     /// 整形の接続先。"opencode-go"、"openai"(API キー)、"chatgpt"(ChatGPT でログイン)、"custom"(OpenAI 互換)
@@ -88,6 +123,13 @@ pub struct FormatConfig {
     pub provider: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
+    #[serde(default)]
+    pub proxy_host: String,
+    #[serde(default)]
+    pub proxy_port: u16,
+    /// ベース URL ごとの出力上限パラメーター。
+    #[serde(default)]
+    pub token_parameters: std::collections::BTreeMap<String, TokenParameter>,
     #[serde(default)]
     pub api_key: String,
     #[serde(default)]
@@ -137,6 +179,9 @@ impl Default for FormatConfig {
     fn default() -> Self {
         Self {
             base_url: default_base_url(),
+            proxy_host: String::new(),
+            proxy_port: 0,
+            token_parameters: Default::default(),
             api_key: String::new(),
             model: String::new(),
             timeout_ms: default_timeout_ms(),
@@ -543,6 +588,35 @@ fn parse_key(key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_parameters_are_per_endpoint_and_azure_defaults_to_completion_tokens() {
+        let azure = "https://example.openai.azure.com/openai/v1";
+        assert_eq!(TokenParameter::Auto.resolve(azure), "max_completion_tokens");
+        assert_eq!(
+            TokenParameter::Auto.resolve("https://example.services.ai.azure.com/openai/v1"),
+            "max_completion_tokens"
+        );
+        assert_eq!(
+            TokenParameter::Auto.resolve("https://example.openai.azure.com.evil.test/v1"),
+            "max_tokens"
+        );
+        assert_eq!(TokenParameter::MaxTokens.resolve(azure), "max_tokens");
+        let text = r#"[format.token_parameters]
+"https://example.openai.azure.com/openai/v1" = "max_tokens"
+"http://localhost:8000/v1" = "max_completion_tokens"
+"#;
+        let cfg = parse(text).unwrap();
+        assert_eq!(
+            cfg.format.token_parameters[azure],
+            TokenParameter::MaxTokens
+        );
+        assert_eq!(
+            cfg.format.token_parameters["http://localhost:8000/v1"],
+            TokenParameter::MaxCompletionTokens
+        );
+        assert!(parse("").unwrap().format.token_parameters.is_empty());
+    }
 
     #[test]
     fn atomic_replace_keeps_old_file_when_new_write_fails() {
